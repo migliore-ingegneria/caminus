@@ -1,10 +1,13 @@
 #![allow(clippy::collapsible_if)]
 
 use crate::source::ChangeEvent;
+use crate::storage::confluent::ConfluentRegistryClient;
 use crate::storage::{StateStore, StorageError};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SchemaCompatibility {
@@ -219,6 +222,119 @@ impl SchemaRegistry {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaMigrationEvent {
+    pub source_id: String,
+    pub schema_id: u32,
+    pub old_schema: Option<Value>,
+    pub new_schema: Value,
+    pub compatibility_mode: SchemaCompatibility,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandshakeResult {
+    Accepted { schema_id: u32 },
+    Rejected { reason: String, routed_to_dlq: bool },
+}
+
+pub struct SchemaMigrationHandshake {
+    pub confluent_client: ConfluentRegistryClient,
+    pub dlq: crate::resiliency::dlq::DeadLetterQueue,
+    broadcast_tx: broadcast::Sender<SchemaMigrationEvent>,
+}
+
+impl SchemaMigrationHandshake {
+    pub fn new(
+        confluent_client: ConfluentRegistryClient,
+        dlq: crate::resiliency::dlq::DeadLetterQueue,
+    ) -> Self {
+        let (broadcast_tx, _) = broadcast::channel(128);
+        Self {
+            confluent_client,
+            dlq,
+            broadcast_tx,
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<SchemaMigrationEvent> {
+        self.broadcast_tx.subscribe()
+    }
+
+    /// Negotiates schema version handshake, verifying compatibility rules (`BACKWARD`/`FULL`),
+    /// routing breaking mutations to DLQ, registering schemas, and streaming async notifications.
+    pub fn negotiate_handshake(
+        &self,
+        store: &StateStore,
+        source_id: &str,
+        new_schema: Value,
+        mode: SchemaCompatibility,
+    ) -> HandshakeResult {
+        let old_schema = match store.get_schema(source_id) {
+            Ok(s) => s,
+            Err(e) => {
+                return HandshakeResult::Rejected {
+                    reason: format!("Failed to read existing schema: {}", e),
+                    routed_to_dlq: false,
+                };
+            }
+        };
+
+        if let Some(ref old) = old_schema {
+            if let Err(compat_err) = SchemaRegistry::check_compatibility(old, &new_schema, mode) {
+                let reason = compat_err.to_string();
+                let event = ChangeEvent {
+                    id: format!("schema-mutation-{}", source_id),
+                    source_database: source_id.to_string(),
+                    source_table_or_collection: "schema_migrations".to_string(),
+                    operation: crate::source::Operation::Update,
+                    timestamp: Utc::now(),
+                    key: serde_json::json!({ "source_id": source_id }),
+                    before: old_schema.clone(),
+                    after: Some(new_schema.clone()),
+                    transaction_id: None,
+                    offset: "0".to_string(),
+                };
+                let dlq_record = crate::resiliency::dlq::DlqRecord::new(
+                    event,
+                    reason.clone(),
+                    "SchemaMigrationHandshake".to_string(),
+                    1,
+                );
+                let _ = self.dlq.route_to_dlq(&dlq_record);
+
+                return HandshakeResult::Rejected {
+                    reason,
+                    routed_to_dlq: true,
+                };
+            }
+        }
+
+        let schema_str = new_schema.to_string();
+        let schema_id = self.confluent_client.register_schema(source_id, &schema_str);
+
+        if let Err(e) = store.save_schema(source_id, &new_schema) {
+            return HandshakeResult::Rejected {
+                reason: format!("Failed to store schema: {}", e),
+                routed_to_dlq: false,
+            };
+        }
+
+        let migration_event = SchemaMigrationEvent {
+            source_id: source_id.to_string(),
+            schema_id,
+            old_schema,
+            new_schema,
+            compatibility_mode: mode,
+            timestamp: Utc::now(),
+        };
+
+        let _ = self.broadcast_tx.send(migration_event);
+
+        HandshakeResult::Accepted { schema_id }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +475,79 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_schema_migration_handshake_negotiation() {
+        let test_path = "./data/test_handshake_db";
+        let _ = fs::remove_dir_all(test_path);
+        let store = StateStore::new(test_path).unwrap();
+
+        let confluent_client = ConfluentRegistryClient::new("http://localhost:8081");
+        let dlq = crate::resiliency::dlq::DeadLetterQueue::new("dlq_schema_topic".into());
+        let handshake = SchemaMigrationHandshake::new(confluent_client, dlq);
+
+        let mut receiver = handshake.subscribe();
+
+        let initial_schema = json!({
+            "fields": {
+                "id": "integer",
+                "name": "string"
+            }
+        });
+
+        // 1. Initial schema handshake negotiation
+        let res1 = handshake.negotiate_handshake(
+            &store,
+            "orders",
+            initial_schema.clone(),
+            SchemaCompatibility::Backward,
+        );
+        assert!(matches!(res1, HandshakeResult::Accepted { .. }));
+
+        let event1 = receiver.recv().await.unwrap();
+        assert_eq!(event1.source_id, "orders");
+        assert_eq!(event1.schema_id, 100);
+
+        // 2. Backward compatible modification (adding field)
+        let compatible_schema = json!({
+            "fields": {
+                "id": "integer",
+                "name": "string",
+                "amount": "float"
+            }
+        });
+        let res2 = handshake.negotiate_handshake(
+            &store,
+            "orders",
+            compatible_schema.clone(),
+            SchemaCompatibility::Backward,
+        );
+        assert!(matches!(res2, HandshakeResult::Accepted { .. }));
+
+        let event2 = receiver.recv().await.unwrap();
+        assert_eq!(event2.schema_id, 100);
+
+        // 3. Backward incompatible modification (deleting field)
+        let incompatible_schema = json!({
+            "fields": {
+                "id": "integer"
+            }
+        });
+        let res3 = handshake.negotiate_handshake(
+            &store,
+            "orders",
+            incompatible_schema,
+            SchemaCompatibility::Backward,
+        );
+        assert!(matches!(
+            res3,
+            HandshakeResult::Rejected {
+                routed_to_dlq: true,
+                ..
+            }
+        ));
+
+        let _ = fs::remove_dir_all(test_path);
     }
 }
